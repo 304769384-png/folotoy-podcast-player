@@ -1,0 +1,85 @@
+name: build-firmware
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Host tests + ESP32-C3 firmware
+    runs-on: ubuntu-22.04
+    container:
+      image: espressif/idf:release-v5.5
+    env:
+      FEED_URL: https://feed.xyzfm.space/dk4yh3pkpjp3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends g++ curl ca-certificates
+
+      - name: Node.js (for lv_font_conv)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download real podcast feed
+        run: |
+          mkdir -p build_cache
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feed.xml "$FEED_URL"
+          echo "Feed size: $(wc -c < /tmp/feed.xml) bytes"
+
+      - name: Host parser tests (Python golden model + g++ cross-check)
+        env:
+          FEED_XML: /tmp/feed.xml
+        run: bash tools/tests/run_tests.sh
+
+      - name: Generate LVGL fonts
+        env:
+          FEED_XML: /tmp/feed.xml
+        run: bash tools/fonts/generate_fonts.sh
+
+      - name: Set target and build
+        run: |
+          . /opt/esp/idf/export.sh >/dev/null
+          idf.py set-target esp32c3
+          idf.py build
+
+      - name: Verify app fits the 3 MB factory partition
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          limit = 0x300000  # factory partition, see partitions.csv
+          size = os.path.getsize("build/Podcast-Player.bin")
+          print(f"App size: {size} bytes ({size/1024/1024:.2f} MiB), limit {limit}")
+          if size > limit:
+              sys.exit(f"App overflow: {size} > {limit}")
+          PY
+
+      - name: Merge flashable full image
+        run: |
+          . /opt/esp/idf/export.sh >/dev/null
+          esptool.py --chip esp32c3 merge-bin \
+            -o Podcast-Player-full.bin --format raw \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/Podcast-Player.bin
+          ls -la Podcast-Player-full.bin build/Podcast-Player.bin
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podcast-Player-firmware
+          if-no-files-found: error
+          path: |
+            Podcast-Player-full.bin
+            build/Podcast-Player.bin
+            main/pod_font.c
+            main/pod_font_cjk.c
