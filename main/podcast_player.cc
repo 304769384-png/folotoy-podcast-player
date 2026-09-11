@@ -25,6 +25,9 @@
 #include <cstring>
 #include <string>
 
+#include <cstdarg>
+#include <cstdio>
+
 namespace {
 
 constexpr char kTag[] = "podcast_player";
@@ -33,6 +36,18 @@ constexpr std::size_t kOutputSize = 8192;
 constexpr std::size_t kLevelCount = 18;
 constexpr std::size_t kMaxEpisodes = 10;
 constexpr uint8_t kMaxFailedAttempts = 3;
+
+// Holds the most recent playback failure reason. Surfaced on the display so a
+// failed episode tells us exactly which stage died instead of a generic
+// "连接失败" (HTTP open, redirect, status, buffer, decoder, format...).
+char s_last_fail[96];
+
+void set_fail(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(s_last_fail, sizeof(s_last_fail), fmt, args);
+    va_end(args);
+}
 
 std::atomic<bool> s_network_connected{false};
 std::atomic<bool> s_wanted_playing{true};
@@ -289,6 +304,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             }
             if (esp_http_client_open(client, 0) != ESP_OK) {
                 ESP_LOGW(kTag, "Open failed: %s", request_url);
+                set_fail("HTTP 打开失败");
                 break;
             }
             esp_http_client_fetch_headers(client);
@@ -299,6 +315,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                         ESP_OK ||
                     location == nullptr || location[0] == '\0') {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
+                    set_fail("重定向无 Location(%d)", status);
                     break;
                 }
                 char *next = resolve_url(request_url, location);
@@ -308,6 +325,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             }
             if (status < 200 || status >= 300) {
                 ESP_LOGW(kTag, "HTTP status %d", status);
+                set_fail("HTTP 状态码=%d", status);
                 break;
             }
             resolved = true;
@@ -321,6 +339,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
         output = static_cast<uint8_t *>(malloc(kOutputSize));
         if (!input || !output) {
             ESP_LOGE(kTag, "Not enough memory for stream buffers");
+            set_fail("内存不足");
             break;
         }
 
@@ -333,6 +352,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
                 ESP_LOGW(kTag, "Stream read error");
+                set_fail("读取音频流失败");
                 break;
             }
             if (received == 0) {
@@ -349,7 +369,10 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             // for it. Feed the first network block onward to the parser.
             if (!decoder) {
                 decoder = open_decoder(preset.url);
-                if (!decoder) break;
+                if (!decoder) {
+                    set_fail("打开解码器失败");
+                    break;
+                }
             }
 
             esp_audio_simple_dec_raw_t raw = {
@@ -373,11 +396,15 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                     ESP_LOGE(kTag, "Decoder needs %u bytes, buffer has %u",
                              static_cast<unsigned>(frame.needed_size),
                              static_cast<unsigned>(kOutputSize));
+                    set_fail("解码缓冲不足 需%u有%u",
+                             static_cast<unsigned>(frame.needed_size),
+                             static_cast<unsigned>(kOutputSize));
                     raw.len = 0;
                     break;
                 }
                 if (result != ESP_AUDIO_ERR_OK) {
                     ESP_LOGW(kTag, "Decode failed: %d", result);
+                    set_fail("解码失败 err=%d", static_cast<int>(result));
                     raw.len = 0;
                     break;
                 }
@@ -399,6 +426,9 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                             ESP_LOGE(kTag, "Unsupported format: %luHz/%ubit/%uch",
                                      static_cast<unsigned long>(info.sample_rate),
                                      info.bits_per_sample, source_channels);
+                            set_fail("格式不支持 %luHz/%u",
+                                     static_cast<unsigned long>(info.sample_rate),
+                                     static_cast<unsigned>(info.bits_per_sample));
                             raw.len = 0;
                             break;
                         }
@@ -505,7 +535,10 @@ void player_task(void *) {
             podcast_player_select_relative(1);
             continue;
         }
-        podcast_ui_set_playback(PodcastPlaybackState::Error, "连接失败，正在重试");
+        podcast_ui_set_playback(PodcastPlaybackState::Error,
+                                (s_last_fail[0] != '\0')
+                                    ? s_last_fail
+                                    : "连接失败，正在重试");
         vTaskDelay(pdMS_TO_TICKS(2500));
     }
 }
