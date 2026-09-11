@@ -20,7 +20,7 @@ fi
 UI_SYMBOLS="$(python3 "$FONT_DIR/make_font_symbols.py" ui)"
 echo "UI font glyphs (CJK): $(printf '%s' "$UI_SYMBOLS" | python3 -c 'import sys; print(len(sys.stdin.read()))')"
 
-npx --yes lv_font_conv@0.16.0 \
+npx --yes lv_font_conv@1.5.3 \
   --font "$FONT_FILE" \
   --range 0x20-0x7F \
   --symbols "$UI_SYMBOLS" \
@@ -36,7 +36,7 @@ else
 fi
 echo "CJK fallback glyphs: $(printf '%s' "$CJK_SYMBOLS" | python3 -c 'import sys; print(len(sys.stdin.read()))')"
 
-npx --yes lv_font_conv@0.16.0 \
+npx --yes lv_font_conv@1.5.3 \
   --font "$FONT_FILE" \
   --symbols "$CJK_SYMBOLS" \
   --size 16 --format lvgl --bpp 1 --no-compress \
