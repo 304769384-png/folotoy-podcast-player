@@ -19,16 +19,19 @@
 
 namespace {
 
-constexpr uint32_t kBackground = 0x071017;
-constexpr uint32_t kPanel = 0x0D1B23;
-constexpr uint32_t kPanelSoft = 0x11262E;
-constexpr uint32_t kGrid = 0x24404A;
-constexpr uint32_t kText = 0xF4F0DE;
-constexpr uint32_t kMuted = 0x849BA0;
-constexpr uint32_t kAmber = 0xFFB74D;
-constexpr uint32_t kAmberSoft = 0x7F5A29;
-constexpr uint32_t kGreen = 0x4ED39A;
-constexpr uint32_t kRed = 0xFF5D62;
+// 高级浅色方案："暖白纸感 + 赭铜点缀"。
+// 低饱和、同色系协调，单一强调色（赭铜）负责焦点，适合随身卡片/簿册的质感，
+// 长期观看不疲劳、也非俗常的纯白 + 荧光强调。
+constexpr uint32_t kBackground = 0xF6F0E4;  // 暖米白底
+constexpr uint32_t kPanel      = 0xFFFCF6;  // 奶白卡片
+constexpr uint32_t kPanelSoft  = 0xF0E7D6;  // 频谱/次级面板，浅暖驼
+constexpr uint32_t kGrid       = 0xDCCCB4;  // 分隔线 / 边框
+constexpr uint32_t kText       = 0x2A2420;  // 炭墨主文字
+constexpr uint32_t kMuted      = 0x968A78;  // 次要灰棕文字
+constexpr uint32_t kAmber      = 0xC2703D;  // 赭铜（唯一强调）
+constexpr uint32_t kAmberSoft  = 0xEBCFAF;  // 赭铜的浅色填充（选中项）
+constexpr uint32_t kGreen      = 0x3E8E6A;  // 燕麦绿，低饱和
+constexpr uint32_t kRed        = 0xBC5348;  // 砖红，低饱和
 
 constexpr std::size_t kMeterCount = 18;
 constexpr std::size_t kWifiVisibleRows = 6;
