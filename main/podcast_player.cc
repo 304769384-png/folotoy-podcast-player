@@ -294,14 +294,13 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             esp_http_client_fetch_headers(client);
             const int status = esp_http_client_get_status_code(client);
             if (status >= 300 && status < 400) {
-                char location[512];
-                const int length = esp_http_client_get_header(
-                    client, "Location", location, sizeof(location) - 1);
-                if (length <= 0) {
+                const char *location = nullptr;
+                if (esp_http_client_get_header(client, "Location", &location) !=
+                        ESP_OK ||
+                    location == nullptr || location[0] == '\0') {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
                     break;
                 }
-                location[length] = '\0';
                 char *next = resolve_url(request_url, location);
                 std::free(request_url);
                 request_url = next;
