@@ -294,7 +294,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             esp_http_client_fetch_headers(client);
             const int status = esp_http_client_get_status_code(client);
             if (status >= 300 && status < 400) {
-                const char *location = nullptr;
+                char *location = nullptr;
                 if (esp_http_client_get_header(client, "Location", &location) !=
                         ESP_OK ||
                     location == nullptr || location[0] == '\0') {
