@@ -77,6 +77,9 @@ std::size_t s_settings_selected;
 std::size_t s_saved_wifi_index;
 std::mutex s_catalog_mutex;
 uint32_t s_catalog_generation;
+std::size_t s_source_index = 0;  // current kPodcastSources[] entry
+
+void switch_source(int delta);  // defined after start_catalog_refresh()
 
 int button_from_mv(int millivolts) {
     if (millivolts < 0 || millivolts >= 1900) return -1;
@@ -641,6 +644,10 @@ void input_task(void *) {
             podcast_player_select_relative(1);
         } else if (message.event == BSP_BTN_CLICK && message.button == BSP_BTN_OK) {
             podcast_player_toggle();
+        } else if (message.event == BSP_BTN_LONG && message.button == BSP_BTN_UP) {
+            switch_source(-1);
+        } else if (message.event == BSP_BTN_LONG && message.button == BSP_BTN_DOWN) {
+            switch_source(1);
         } else if (message.event == BSP_BTN_LONG && message.button == BSP_BTN_OK) {
             s_settings_mode.store(true);
             s_settings_input_mode = SettingsInputMode::Menu;
@@ -667,43 +674,90 @@ void start_sntp_once() {
     }
 }
 
+// Compact source indicator shown above the episode list, e.g. "2/5 硅谷101"
+// or "2/5 硅谷101 · 更新中". s_podcast_name_text is 48 bytes; keep labels short.
+std::string source_display_label(std::size_t index, const char *suffix) {
+    std::string label = std::to_string(index + 1) + "/" +
+                        std::to_string(kPodcastSourceCount) + " " +
+                        kPodcastSources[index].name;
+    if (suffix) {
+        label += " ";
+        label += suffix;
+    }
+    return label;
+}
+
+void switch_source(int delta) {
+    if (s_config_mode.load() || s_settings_mode.load()) return;
+    std::size_t index = 0;
+    {
+        std::lock_guard<std::mutex> lock(s_catalog_mutex);
+        index = (s_source_index + kPodcastSourceCount + delta) %
+                kPodcastSourceCount;
+        s_source_index = index;
+        ++s_catalog_generation;  // invalidate any in-flight fetch for the old source
+    }
+    podcast_player_set_playing(false);
+    const PodcastEpisode empty{};
+    podcast_ui_set_episode(0, 0, empty);
+    podcast_ui_set_podcast_name(source_display_label(index, nullptr).c_str());
+    start_catalog_refresh();
+}
+
 void start_catalog_refresh() {
     bool task_running = false;
+    std::size_t src_index = 0;
     {
         std::lock_guard<std::mutex> lock(s_catalog_mutex);
         ++s_catalog_generation;
         task_running = s_catalog_task != nullptr;
-        if (!task_running &&
-            xTaskCreate([](void *) {
-                auto *episodes = static_cast<PodcastEpisode *>(
-                    std::calloc(kEpisodeCapacity, sizeof(PodcastEpisode)));
+        src_index = s_source_index;
+    }
+    if (!task_running &&
+        xTaskCreate([](void *) {
+            // Loop so a source switch mid-fetch re-runs for the current source
+            // instead of dropping the refresh.
+            while (true) {
+                const PodcastSource *src = nullptr;
                 uint32_t generation = 0;
                 {
                     std::lock_guard<std::mutex> lock(s_catalog_mutex);
                     generation = s_catalog_generation;
+                    src = &kPodcastSources[s_source_index];
                 }
-                if (episodes) {
-                    const std::size_t count = podcast_catalog_fetch(
-                        kPodcastSources[0].feed_url, episodes, kEpisodeCapacity);
+                auto *episodes = static_cast<PodcastEpisode *>(
+                    std::calloc(kEpisodeCapacity, sizeof(PodcastEpisode)));
+                if (!episodes) {
+                    s_catalog_task = nullptr;
+                    vTaskDelete(nullptr);
+                }
+                const std::size_t count = podcast_catalog_fetch(
+                    src->feed_url, episodes, kEpisodeCapacity);
+                bool restart = false;
+                {
                     std::lock_guard<std::mutex> lock(s_catalog_mutex);
-                    if (generation == s_catalog_generation &&
-                        s_connected.load(std::memory_order_acquire)) {
+                    if (generation != s_catalog_generation) {
+                        restart = true;  // user switched sources; retry current one
+                    } else if (s_connected.load(std::memory_order_acquire)) {
                         if (count > 0) {
                             podcast_player_replace_episodes(episodes, count);
                         }
-                        podcast_ui_set_podcast_name(kPodcastSources[0].name);
+                        podcast_ui_set_podcast_name(
+                            source_display_label(s_source_index, nullptr).c_str());
                         podcast_player_set_network(true);
                     }
-                    std::free(episodes);
                 }
-                s_catalog_task = nullptr;
-                vTaskDelete(nullptr);
-            }, "podcast_catalog", 8192, nullptr, 5, &s_catalog_task) != pdPASS) {
+                std::free(episodes);
+                if (!restart) break;
+            }
             s_catalog_task = nullptr;
-        }
+            vTaskDelete(nullptr);
+        }, "podcast_catalog", 8192, nullptr, 5, &s_catalog_task) != pdPASS) {
+        s_catalog_task = nullptr;
     }
     podcast_player_set_network(false);
-    podcast_ui_set_podcast_name("正在加载节目");
+    podcast_ui_set_podcast_name(
+        source_display_label(src_index, "更新中").c_str());
     podcast_ui_set_playback(PodcastPlaybackState::Buffering, "正在更新节目单");
     if (!task_running && !s_catalog_task) {
         podcast_player_set_network(true);

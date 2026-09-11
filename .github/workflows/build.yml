@@ -29,12 +29,27 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Download real podcast feed
+      - name: Download real podcast feeds
         run: |
-          mkdir -p build_cache
+          mkdir -p /tmp/feeds
+          # One primary feed for the host parser test (张小珺).
           curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
             -o /tmp/feed.xml "$FEED_URL"
-          echo "Feed size: $(wc -c < /tmp/feed.xml) bytes"
+          # All configured feeds are merged so the CJK fallback font covers the
+          # rare/GBK-only characters found in every source's titles.
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feeds/zhangxiaojun.xml "https://feed.xyzfm.space/dk4yh3pkpjp3"
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feeds/sv101.xml "https://feeds.fireside.fm/sv101/rss"
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feeds/latetalk.xml "https://feeds.fireside.fm/latetalk/rss"
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feeds/bannatie.xml "https://proxy.wavpub.com/caffebreve.xml"
+          curl -fsSL --retry 3 -A "AI-Passport-Podcast/0.1" \
+            -o /tmp/feeds/zuzhi.xml "https://feed.xyzfm.space/wb9n7uukpubp"
+          cat /tmp/feeds/*.xml > /tmp/allfeeds.xml
+          echo "Primary feed size: $(wc -c < /tmp/feed.xml) bytes"
+          echo "Merged feeds: $(wc -c < /tmp/allfeeds.xml) bytes"
 
       - name: Host parser tests (Python golden model + g++ cross-check)
         env:
@@ -43,7 +58,7 @@ jobs:
 
       - name: Generate LVGL fonts
         env:
-          FEED_XML: /tmp/feed.xml
+          FEED_XML: /tmp/allfeeds.xml
         run: bash tools/fonts/generate_fonts.sh
 
       - name: Set target and build
