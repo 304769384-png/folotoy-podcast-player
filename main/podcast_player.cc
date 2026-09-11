@@ -21,7 +21,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace {
 
@@ -212,6 +214,31 @@ esp_audio_simple_dec_handle_t open_decoder(const char *url) {
 
 // Streams one episode. `completed` is set true only when audio played and the
 // file reached a natural end of stream (podcast finished, advance to next).
+// Turn a possibly-relative HTTP "Location" header into an absolute URL.
+// Some podcast CDNs (e.g. Fireside) hand back a relative path on redirect.
+char *resolve_url(const char *base, const char *location) {
+    if (std::strncmp(location, "http://", 7) == 0 ||
+        std::strncmp(location, "https://", 8) == 0) {
+        return strdup(location);
+    }
+    const char *scheme_end = std::strstr(base, "://");
+    if (!scheme_end) return strdup(location);
+    const char *host_start = scheme_end + 3;
+    const char *path_start = std::strchr(host_start, '/');
+    const std::string scheme(base, scheme_end - base);
+    const std::string authority =
+        path_start ? std::string(host_start, path_start)
+                   : std::string(host_start);
+    if (location[0] == '/') {
+        return strdup((scheme + "//" + authority + location).c_str());
+    }
+    std::string base_path =
+        path_start ? std::string(path_start) : std::string("/");
+    const std::string::size_type slash = base_path.find_last_of('/');
+    if (slash != std::string::npos) base_path.resize(slash + 1);
+    return strdup((scheme + "//" + authority + base_path + location).c_str());
+}
+
 bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     if (completed) *completed = false;
     const PodcastEpisode preset = episode_snapshot(episode);
@@ -233,13 +260,8 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     if (std::strncmp(preset.url, "https://", 8) == 0) {
         config.crt_bundle_attach = esp_crt_bundle_attach;
     }
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(kTag, "HTTP client allocation failed");
-        return false;
-    }
-    esp_http_client_set_header(client, "Accept", "audio/mp4,audio/mpeg,*/*");
-    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    esp_http_client_handle_t client = nullptr;
+    char *request_url = strdup(preset.url);
 
     bool played_audio = false;
     bool clean_eof = false;
@@ -248,16 +270,53 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     uint8_t *output = nullptr;
 
     do {
-        if (esp_http_client_open(client, 0) != ESP_OK) {
-            ESP_LOGW(kTag, "Open failed: %s", preset.url);
-            break;
+        // Every audio source here serves its file behind a 3xx redirect (the
+        // xiaoyuzhou dts, Fireside and Ximalaya links all 302 to the real CDN).
+        // The streaming open()->read() flow does not chase redirects itself,
+        // so resolve up to 4 hops by hand before decoding.
+        bool resolved = false;
+        for (int hop = 0; hop < 4 && !resolved; ++hop) {
+            if (client) {
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                client = nullptr;
+            }
+            config.url = request_url;
+            client = esp_http_client_init(&config);
+            if (!client) {
+                ESP_LOGE(kTag, "HTTP client allocation failed");
+                break;
+            }
+            if (esp_http_client_open(client, 0) != ESP_OK) {
+                ESP_LOGW(kTag, "Open failed: %s", request_url);
+                break;
+            }
+            esp_http_client_fetch_headers(client);
+            const int status = esp_http_client_get_status_code(client);
+            if (status >= 300 && status < 400) {
+                char location[512];
+                const int length = esp_http_client_get_header(
+                    client, "Location", location, sizeof(location) - 1);
+                if (length <= 0) {
+                    ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
+                    break;
+                }
+                location[length] = '\0';
+                char *next = resolve_url(request_url, location);
+                std::free(request_url);
+                request_url = next;
+                continue;  // follow the redirect on the next hop
+            }
+            if (status < 200 || status >= 300) {
+                ESP_LOGW(kTag, "HTTP status %d", status);
+                break;
+            }
+            resolved = true;
         }
-        esp_http_client_fetch_headers(client);
-        const int status = esp_http_client_get_status_code(client);
-        if (status < 200 || status >= 300) {
-            ESP_LOGW(kTag, "HTTP status %d", status);
-            break;
-        }
+        if (!resolved) break;
+
+        esp_http_client_set_header(client, "Accept", "audio/mp4,audio/mpeg,*/*");
+        esp_http_client_set_header(client, "Accept-Encoding", "identity");
 
         input = static_cast<uint8_t *>(malloc(kInputSize));
         output = static_cast<uint8_t *>(malloc(kOutputSize));
@@ -378,8 +437,11 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     if (decoder) esp_audio_simple_dec_close(decoder);
     free(output);
     free(input);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    std::free(request_url);
     if (completed) *completed = clean_eof;
     return played_audio;
 }
