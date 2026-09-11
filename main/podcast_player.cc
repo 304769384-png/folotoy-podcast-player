@@ -304,7 +304,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             }
             if (esp_http_client_open(client, 0) != ESP_OK) {
                 ESP_LOGW(kTag, "Open failed: %s", request_url);
-                set_fail("HTTP 打开失败");
+                set_fail("E1 open fail");
                 break;
             }
             esp_http_client_fetch_headers(client);
@@ -315,7 +315,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                         ESP_OK ||
                     location == nullptr || location[0] == '\0') {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
-                    set_fail("重定向无 Location(%d)", status);
+                    set_fail("E2 redirect no loc");
                     break;
                 }
                 char *next = resolve_url(request_url, location);
@@ -325,7 +325,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             }
             if (status < 200 || status >= 300) {
                 ESP_LOGW(kTag, "HTTP status %d", status);
-                set_fail("HTTP 状态码=%d", status);
+                set_fail("E3 http %d", status);
                 break;
             }
             resolved = true;
@@ -339,7 +339,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
         output = static_cast<uint8_t *>(malloc(kOutputSize));
         if (!input || !output) {
             ESP_LOGE(kTag, "Not enough memory for stream buffers");
-            set_fail("内存不足");
+            set_fail("E4 mem");
             break;
         }
 
@@ -352,7 +352,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
                 ESP_LOGW(kTag, "Stream read error");
-                set_fail("读取音频流失败");
+                set_fail("E5 read err");
                 break;
             }
             if (received == 0) {
@@ -370,7 +370,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             if (!decoder) {
                 decoder = open_decoder(preset.url);
                 if (!decoder) {
-                    set_fail("打开解码器失败");
+                    set_fail("E6 dec open");
                     break;
                 }
             }
@@ -396,7 +396,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                     ESP_LOGE(kTag, "Decoder needs %u bytes, buffer has %u",
                              static_cast<unsigned>(frame.needed_size),
                              static_cast<unsigned>(kOutputSize));
-                    set_fail("解码缓冲不足 需%u有%u",
+                    set_fail("E7 buf %u/%u",
                              static_cast<unsigned>(frame.needed_size),
                              static_cast<unsigned>(kOutputSize));
                     raw.len = 0;
@@ -404,7 +404,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                 }
                 if (result != ESP_AUDIO_ERR_OK) {
                     ESP_LOGW(kTag, "Decode failed: %d", result);
-                    set_fail("解码失败 err=%d", static_cast<int>(result));
+                    set_fail("E8 dec %d", static_cast<int>(result));
                     raw.len = 0;
                     break;
                 }
@@ -426,9 +426,8 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                             ESP_LOGE(kTag, "Unsupported format: %luHz/%ubit/%uch",
                                      static_cast<unsigned long>(info.sample_rate),
                                      info.bits_per_sample, source_channels);
-                            set_fail("格式不支持 %luHz/%u",
-                                     static_cast<unsigned long>(info.sample_rate),
-                                     static_cast<unsigned>(info.bits_per_sample));
+                            set_fail("E9 fmt %lu",
+                             static_cast<unsigned long>(info.sample_rate));
                             raw.len = 0;
                             break;
                         }
