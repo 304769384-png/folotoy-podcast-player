@@ -79,7 +79,8 @@ std::mutex s_catalog_mutex;
 uint32_t s_catalog_generation;
 std::size_t s_source_index = 0;  // current kPodcastSources[] entry
 
-void switch_source(int delta);  // defined after start_catalog_refresh()
+void switch_source(int delta);          // defined after start_catalog_refresh()
+void start_catalog_refresh();           // defined below, called by switch_source()
 
 int button_from_mv(int millivolts) {
     if (millivolts < 0 || millivolts >= 1900) return -1;
