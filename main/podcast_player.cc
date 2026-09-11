@@ -269,9 +269,12 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     config.buffer_size = 2048;
     config.buffer_size_tx = 512;
     config.user_agent = "AI-Passport-Podcast/0.1";
-    config.keep_alive_enable = true;
-    config.disable_auto_redirect = false;
-    config.max_redirection_count = 4;
+    config.keep_alive_enable = false;
+    // Streaming follows redirects by hand below (up to 4 hops, full per-hop
+    // teardown before re-open). Disable esp_http_client's own follower so the
+    // two mechanisms never both chase a 3xx on a cross-host TLS stream.
+    config.disable_auto_redirect = true;
+    config.max_redirection_count = 0;
     if (std::strncmp(preset.url, "https://", 8) == 0) {
         config.crt_bundle_attach = esp_crt_bundle_attach;
     }
