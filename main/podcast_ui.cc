@@ -783,8 +783,10 @@ void timer_callback(lv_timer_t *) {
 bool podcast_ui_init() {
     if (!bsp_lvgl_lock(1000)) return false;
     // The compact UI font covers interface vocabulary; the GB2312 fallback
-    // supplies arbitrary Chinese characters in episode titles.
-    lv_font_set_fallback(&pod_font, &pod_font_cjk);
+    // supplies arbitrary Chinese characters in episode titles. LVGL 9.x has no
+    // lv_font_set_fallback(); the fallback is a mutable struct field, so pod_font
+    // is declared non-const and wired here.
+    pod_font.fallback = &pod_font_cjk;
     s_screen = lv_obj_create(nullptr);
     lv_obj_remove_style_all(s_screen);
     lv_obj_set_style_bg_color(s_screen, lv_color_hex(kBackground), 0);

@@ -28,6 +28,11 @@ npx --yes lv_font_conv@1.5.3 \
   --lv-include lvgl.h --lv-font-name pod_font \
   -o main/pod_font.c
 
+# LVGL 9.x has no lv_font_set_fallback(); the CJK fallback is wired via the
+# mutable `.fallback` field. pod_font must be non-const for that (see
+# main/pod_font.h). lv_font_conv emits `const lv_font_t pod_font`, so strip it.
+sed -i 's/^const lv_font_t pod_font = {$/lv_font_t pod_font = {/' main/pod_font.c
+
 if [ -n "${FEED_XML:-}" ] && [ -f "$FEED_XML" ]; then
   CJK_SYMBOLS="$(python3 "$FONT_DIR/make_font_symbols.py" cjk "$FEED_XML")"
 else

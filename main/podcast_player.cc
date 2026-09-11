@@ -194,7 +194,7 @@ bool ends_with(const char *text, const char *suffix) {
 // supports sequential streaming (no seek), which matches HTTP forward reads.
 esp_audio_simple_dec_handle_t open_decoder(const char *url) {
     const bool m4a = ends_with(url, ".m4a") || ends_with(url, ".mp4");
-    const esp_audio_simple_dec_cfg_t config = {
+    esp_audio_simple_dec_cfg_t config = {
         .dec_type = m4a ? ESP_AUDIO_SIMPLE_DEC_TYPE_M4A
                         : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
         .dec_cfg = nullptr,
