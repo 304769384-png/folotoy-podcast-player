@@ -66,7 +66,7 @@ jobs:
       - name: Merge flashable full image
         run: |
           . /opt/esp/idf/export.sh >/dev/null
-          esptool.py --chip esp32c3 merge-bin \
+          esptool.py --chip esp32c3 merge_bin \
             -o Podcast-Player-full.bin --format raw \
             0x0 build/bootloader/bootloader.bin \
             0x8000 build/partition_table/partition-table.bin \
