@@ -149,7 +149,10 @@ void closing_seq(PodcastFeedParser *p, uint8_t b, const char *target) {
 }
 
 void append(char *buf, std::size_t cap, std::size_t *len, char ch) {
-    if (*len + 1 < cap) buf[(*len)++] = ch;
+    if (*len + 1 < cap) {
+        buf[(*len)++] = ch;
+        buf[*len] = '\0';
+    }
 }
 
 void emit_episode(PodcastFeedParser *p) {
