@@ -20,9 +20,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install host toolchain
+        shell: bash
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends g++ curl ca-certificates
+          retry() { for i in 1 2 3; do "$@" && return 0; sleep 15; done; return 1; }
+          # Hash Sum mismatch / transient apt index errors on hosted runners are
+          # common; disable HTTP pipelining and force a fresh index each retry.
+          echo 'Acquire::http::Pipeline-Depth 0;' > /etc/apt/apt.conf.d/99nopipe
+          echo 'Acquire::Retries 5;'            > /etc/apt/apt.conf.d/99retries
+          retry apt-get -o Acquire::http::Pipeline-Depth=0 update
+          retry apt-get install -y --no-install-recommends g++ curl ca-certificates
 
       - name: Node.js (for lv_font_conv)
         uses: actions/setup-node@v4
