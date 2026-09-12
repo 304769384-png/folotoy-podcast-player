@@ -313,10 +313,22 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             esp_http_client_fetch_headers(client);
             const int status = esp_http_client_get_status_code(client);
             if (status >= 300 && status < 400) {
+                // esp_http_client_get_header() matches the header NAME
+                // case-sensitively (strcmp). CDNs commonly send lowercase
+                // "location:" (e.g. xiaoyuzhou's dts-api returns a 302 with
+                // "location:"), which made the old single "Location" lookup
+                // fail with E2 and abort every episode of those sources. Probe
+                // the common casings so redirect following is case-agnostic.
                 char *location = nullptr;
-                if (esp_http_client_get_header(client, "Location", &location) !=
-                        ESP_OK ||
-                    location == nullptr || location[0] == '\0') {
+                for (const char *key : {"Location", "location", "LOCATION"}) {
+                    char *v = nullptr;
+                    if (esp_http_client_get_header(client, key, &v) == ESP_OK &&
+                        v != nullptr && v[0] != '\0') {
+                        location = v;
+                        break;
+                    }
+                }
+                if (location == nullptr) {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
                     set_fail("E2 redirect no loc");
                     break;
