@@ -32,11 +32,117 @@
 namespace {
 
 constexpr char kTag[] = "podcast_player";
-constexpr std::size_t kInputSize = 2048;  // larger chunks speed M4A moov intake
+// Larger network read chunks amortise TLS/HTTP overhead, which is what makes
+// both the initial fill and the steady stream faster (the old 2 KB reads
+// caused long "正在缓冲" and starved the tiny I2S DMA ring).
+constexpr std::size_t kInputSize = 8192;
 constexpr std::size_t kOutputSize = 8192;
 constexpr std::size_t kLevelCount = 18;
 constexpr std::size_t kMaxEpisodes = 10;
 constexpr uint8_t kMaxFailedAttempts = 3;
+
+// ---- Buffering architecture (two-task produce/consume) ----
+// Playback is split into two tasks. A "producer" task reads + decodes the
+// network stream into a software ring (it keeps running ahead even while
+// paused); a "consumer" task on player_task drains the surplus to the I2S
+// speaker at real time. The previous single-threaded loop called the blocking
+// bsp_audio_write() (which is paced by real time) in the same iteration as the
+// network read, so any slow read starved the ~32 ms I2S DMA ring and produced
+// a "stalled second for every played second" stutter. Splitting the tasks
+// means the speaker keeps playing from the in-RAM cushion while a slow read
+// fills behind it, and pausing only halts the consumer so the buffer keeps
+// topping up (resume is instant instead of a full re-buffer).
+constexpr std::size_t kPcmRingSize = 65536;       // ~0.74 s @44.1 kHz mono
+constexpr std::size_t kPcmStartThreshold = 16384; // start after ~0.19 s buffered
+constexpr std::size_t kPcmCushion = 8192;         // keep this slack while playing
+constexpr std::size_t kDrainChunk = 2048;
+
+// Simple single-producer / single-consumer ring buffer for decoded PCM.
+struct PcmRing {
+    uint8_t *buf = nullptr;
+    std::size_t size = 0;
+    std::size_t head = 0;
+    std::size_t used = 0;
+
+    explicit PcmRing(std::size_t bytes) : size(bytes) {
+        buf = static_cast<uint8_t *>(malloc(bytes));
+    }
+    ~PcmRing() { std::free(buf); }
+    PcmRing(const PcmRing &) = delete;
+    PcmRing &operator=(const PcmRing &) = delete;
+
+    std::size_t used_bytes() const { return used; }
+    std::size_t free_space() const { return size - used; }
+
+    std::size_t write(const uint8_t *data, std::size_t n) {
+        const std::size_t space = size - used;
+        n = std::min(n, space);
+        if (n == 0) return 0;
+        const std::size_t pos = (head + used) % size;
+        const std::size_t first = std::min(n, size - pos);
+        std::memcpy(buf + pos, data, first);
+        if (first < n) std::memcpy(buf, data + first, n - first);
+        used += n;
+        return n;
+    }
+
+    std::size_t read(uint8_t *out, std::size_t n) {
+        n = std::min(n, used);
+        if (n == 0) return 0;
+        const std::size_t first = std::min(n, size - head);
+        std::memcpy(out, buf + head, first);
+        if (first < n) std::memcpy(out + first, buf, n - first);
+        head = (head + n) % size;
+        used -= n;
+        return n;
+    }
+};
+
+// Shared state between the producer and consumer tasks of one stream.
+struct StreamCtx {
+    PcmRing *pcm = nullptr;
+    SemaphoreHandle_t mutex = nullptr;    // guards the ring (single prod/consumer)
+    SemaphoreHandle_t data_new = nullptr; // counting: signalled when audio is added
+    std::atomic<bool> eof{false};         // producer reached network end of stream
+    std::atomic<bool> format_ready{false};// codec format configured + volume set
+    std::atomic<bool> stop{false};        // consumer asked the producer to wind down
+    std::atomic<bool> producer_done{false};
+    std::atomic<esp_http_client_handle_t> client{nullptr};
+    uint8_t channels = 1;
+};
+
+// Thread-safe accessors over the shared ring (only touched by the two tasks).
+std::size_t ring_used(StreamCtx &ctx) {
+    if (!ctx.mutex || !ctx.pcm) return 0;
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(60)) != pdTRUE) return 0;
+    const std::size_t used = ctx.pcm->used_bytes();
+    xSemaphoreGive(ctx.mutex);
+    return used;
+}
+
+std::size_t ring_write(StreamCtx &ctx, const uint8_t *data, std::size_t n) {
+    if (!ctx.mutex || !ctx.pcm) return 0;
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(60)) != pdTRUE) return 0;
+    const std::size_t wrote = ctx.pcm->write(data, n);
+    xSemaphoreGive(ctx.mutex);
+    return wrote;
+}
+
+std::size_t ring_read(StreamCtx &ctx, uint8_t *out, std::size_t n) {
+    if (!ctx.mutex || !ctx.pcm) return 0;
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(60)) != pdTRUE) return 0;
+    const std::size_t got = ctx.pcm->read(out, n);
+    xSemaphoreGive(ctx.mutex);
+    return got;
+}
+
+std::size_t ring_space(StreamCtx &ctx) {
+    if (!ctx.mutex || !ctx.pcm) return 0;
+    if (xSemaphoreTake(ctx.mutex, pdMS_TO_TICKS(60)) != pdTRUE) return 0;
+    const std::size_t space = ctx.pcm->free_space();
+    xSemaphoreGive(ctx.mutex);
+    return space;
+}
 
 // Holds the most recent playback failure reason. Surfaced on the display so a
 // failed episode tells us exactly which stage died instead of a generic
@@ -149,6 +255,16 @@ bool request_still_current(uint32_t generation, std::size_t episode) {
     return s_network_connected.load(std::memory_order_acquire) &&
            s_wanted_playing.load(std::memory_order_acquire) &&
            s_generation.load(std::memory_order_acq_rel) == generation &&
+           s_episode_index.load(std::memory_order_acquire) == episode;
+}
+
+// Streaming continuity for inside stream_episode: keep the live connection and
+// decoder alive as long as the same episode is selected and the network is up.
+// Deliberately does NOT check s_wanted_playing or generation, so pausing only
+// stops the speaker (handled in the loop) without tearing down the stream,
+// which makes resume instant instead of a full re-download + re-buffer.
+bool stream_alive(std::size_t episode) {
+    return s_network_connected.load(std::memory_order_acquire) &&
            s_episode_index.load(std::memory_order_acquire) == episode;
 }
 
@@ -282,111 +398,119 @@ esp_err_t redirect_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
-    if (completed) *completed = false;
-    const PodcastEpisode preset = episode_snapshot(episode);
-    if (!preset.url[0]) {
-        ESP_LOGE(kTag, "Episode %u has no URL", static_cast<unsigned>(episode));
-        return false;
-    }
-    podcast_ui_set_playback(PodcastPlaybackState::Connecting, "正在连接节目");
+struct ProducerArg {
+    StreamCtx *ctx = nullptr;
+    const char *url = nullptr;
+    std::size_t episode = 0;
+};
 
+// Producer task: owns the HTTP connection + decoder, reads compressed bytes,
+// decodes them into the shared ring, and signals the consumer. It deliberately
+// does NOT touch the speaker and deliberately does NOT stop when paused, so it
+// keeps topping up the ring while the user pauses (resume is instant) and is
+// never blocked by the real-time drain (no per-read stutter).
+void stream_producer(void *arg_ptr) {
+    ProducerArg *arg = static_cast<ProducerArg *>(arg_ptr);
+    StreamCtx &ctx = *arg->ctx;
+    const char *preset_url = arg->url;
+    const std::size_t episode = arg->episode;
+
+    uint8_t *input = static_cast<uint8_t *>(malloc(kInputSize));
+    uint8_t *output = static_cast<uint8_t *>(malloc(kOutputSize));
+    if (!input || !output) {
+        set_fail("E4 mem");
+        ctx.eof.store(true, std::memory_order_release);
+        std::free(input);
+        std::free(output);
+        ctx.producer_done.store(true, std::memory_order_release);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char *request_url = strdup(preset_url);
+    esp_http_client_handle_t client = nullptr;
+    esp_audio_simple_dec_handle_t decoder = nullptr;
     RedirectCtx redirect_ctx{};
     esp_http_client_config_t config = {};
-    config.url = preset.url;
+    config.url = preset_url;
     config.timeout_ms = 10000;
-    config.buffer_size = 2048;
-    config.buffer_size_tx = 512;
+    config.buffer_size = 8192;
+    config.buffer_size_tx = 1024;
     config.user_agent = "AI-Passport-Podcast/0.1";
     config.keep_alive_enable = false;
-    // esp_http_client only auto-follows redirects inside the blocking
-    // perform() path; the streaming open()->read() flow does not. So we
-    // resolve hops by hand below, capturing each Location via the
-    // HTTP_EVENT_ON_HEADER event into redirect_ctx.
     config.disable_auto_redirect = true;
     config.max_redirection_count = 0;
     config.event_handler = redirect_event_handler;
     config.user_data = &redirect_ctx;
-    if (std::strncmp(preset.url, "https://", 8) == 0) {
+    if (std::strncmp(preset_url, "https://", 8) == 0) {
         config.crt_bundle_attach = esp_crt_bundle_attach;
     }
-    esp_http_client_handle_t client = nullptr;
-    char *request_url = strdup(preset.url);
 
-    bool played_audio = false;
-    bool clean_eof = false;
-    esp_audio_simple_dec_handle_t decoder = nullptr;
-    uint8_t *input = nullptr;
-    uint8_t *output = nullptr;
-
-    do {
-        // Every audio source here serves its file behind a 3xx redirect (the
-        // xiaoyuzhou dts, Fireside and Ximalaya links all 302 to the real CDN).
-        // The streaming open()->read() flow does not chase redirects itself,
-        // so resolve up to 4 hops by hand before decoding.
-        bool resolved = false;
-        for (int hop = 0; hop < 4 && !resolved; ++hop) {
-            if (client) {
-                esp_http_client_close(client);
-                esp_http_client_cleanup(client);
-                client = nullptr;
-            }
-            config.url = request_url;
-            redirect_ctx.has_location = false;
-            redirect_ctx.location[0] = '\0';
-            client = esp_http_client_init(&config);
-            if (!client) {
-                ESP_LOGE(kTag, "HTTP client allocation failed");
-                break;
-            }
-            if (esp_http_client_open(client, 0) != ESP_OK) {
-                ESP_LOGW(kTag, "Open failed: %s", request_url);
-                set_fail("E1 open fail");
-                break;
-            }
-            esp_http_client_fetch_headers(client);
-            const int status = esp_http_client_get_status_code(client);
-            if (status >= 300 && status < 400) {
-                // esp_http_client_get_header() reads only *request* headers and
-                // the handle is opaque, so the redirect's response Location is
-                // only reachable through HTTP_EVENT_ON_HEADER, which
-                // redirect_event_handler above captured into redirect_ctx.
-                if (!redirect_ctx.has_location ||
-                    redirect_ctx.location[0] == '\0') {
-                    ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
-                    set_fail("E2 redirect no loc");
-                    break;
-                }
-                char *next = resolve_url(request_url, redirect_ctx.location);
-                std::free(request_url);
-                request_url = next;
-                continue;  // follow the redirect on the next hop
-            }
-            if (status < 200 || status >= 300) {
-                ESP_LOGW(kTag, "HTTP status %d", status);
-                set_fail("E3 http %d", status);
-                break;
-            }
-            resolved = true;
+    // Follow up to 4 manual redirect hops (streaming read() never auto-follows).
+    bool run = true;
+    bool resolved = false;
+    for (int hop = 0; hop < 4 && !resolved && run; ++hop) {
+        if (client) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            client = nullptr;
         }
-        if (!resolved) break;
+        config.url = request_url;
+        redirect_ctx.has_location = false;
+        redirect_ctx.location[0] = '\0';
+        client = esp_http_client_init(&config);
+        if (!client) {
+            ESP_LOGE(kTag, "HTTP client allocation failed");
+            set_fail("E1 alloc");
+            run = false;
+            break;
+        }
+        if (esp_http_client_open(client, 0) != ESP_OK) {
+            ESP_LOGW(kTag, "Open failed: %s", request_url);
+            set_fail("E1 open fail");
+            run = false;
+            break;
+        }
+        esp_http_client_fetch_headers(client);
+        const int status = esp_http_client_get_status_code(client);
+        if (status >= 300 && status < 400) {
+            if (!redirect_ctx.has_location || redirect_ctx.location[0] == '\0') {
+                ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
+                set_fail("E2 redirect no loc");
+                run = false;
+                break;
+            }
+            char *next = resolve_url(request_url, redirect_ctx.location);
+            std::free(request_url);
+            request_url = next;
+            continue;
+        }
+        if (status < 200 || status >= 300) {
+            ESP_LOGW(kTag, "HTTP status %d", status);
+            set_fail("E3 http %d", status);
+            run = false;
+            break;
+        }
+        resolved = true;
+    }
+    if (run && !resolved) run = false;
 
+    if (run) {
+        ctx.client.store(client, std::memory_order_release);
         esp_http_client_set_header(client, "Accept", "audio/mp4,audio/mpeg,*/*");
         esp_http_client_set_header(client, "Accept-Encoding", "identity");
 
-        input = static_cast<uint8_t *>(malloc(kInputSize));
-        output = static_cast<uint8_t *>(malloc(kOutputSize));
-        if (!input || !output) {
-            ESP_LOGE(kTag, "Not enough memory for stream buffers");
-            set_fail("E4 mem");
-            break;
-        }
-
-        podcast_ui_set_playback(PodcastPlaybackState::Buffering, "正在缓冲");
-        bool format_ready = false;
-        uint8_t source_channels = 1;
+        bool stream_eof = false;
         int empty_reads = 0;
-        while (request_still_current(generation, episode)) {
+        while (stream_alive(episode) && !ctx.stop.load(std::memory_order_acquire)) {
+            if (ctx.format_ready.load(std::memory_order_acquire) &&
+                ring_space(ctx) == 0) {
+                // The consumer cannot keep up (e.g. the user is paused and the
+                // ring is fully topped up): backpressure here instead of
+                // feeding the decoder cache unboundedly while nothing drains.
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
             const int received = esp_http_client_read(
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
@@ -396,119 +520,291 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             }
             if (received == 0) {
                 if (++empty_reads > 3) {
-                    clean_eof = played_audio;  // natural end after playback
-                    break;
+                    stream_eof = true;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                    continue;
                 }
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
             }
             empty_reads = 0;
 
-            // The decoder is opened lazily so the HTTP error path never pays
-            // for it. Feed the first network block onward to the parser.
             if (!decoder) {
-                decoder = open_decoder(preset.url);
+                decoder = open_decoder(preset_url);
                 if (!decoder) {
                     set_fail("E6 dec open");
+                    run = false;
                     break;
                 }
             }
 
-            esp_audio_simple_dec_raw_t raw = {
-                .buffer = input,
-                .len = static_cast<uint32_t>(received),
-                .eos = false,
-                .consumed = 0,
-                .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
-            };
-            while (raw.len > 0 && request_still_current(generation, episode)) {
-                esp_audio_simple_dec_out_t frame = {
-                    .buffer = output,
-                    .len = kOutputSize,
-                    .needed_size = 0,
-                    .decoded_size = 0,
+            if (received > 0) {
+                esp_audio_simple_dec_raw_t raw = {
+                    .buffer = input,
+                    .len = static_cast<uint32_t>(received),
+                    .eos = false,
+                    .consumed = 0,
+                    .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
                 };
-                const uint32_t before = raw.len;
-                const esp_audio_err_t result =
-                    esp_audio_simple_dec_process(decoder, &raw, &frame);
-                if (result == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                    ESP_LOGE(kTag, "Decoder needs %u bytes, buffer has %u",
-                             static_cast<unsigned>(frame.needed_size),
-                             static_cast<unsigned>(kOutputSize));
-                    set_fail("E7 buf %u/%u",
-                             static_cast<unsigned>(frame.needed_size),
-                             static_cast<unsigned>(kOutputSize));
-                    raw.len = 0;
-                    break;
-                }
-                if (result != ESP_AUDIO_ERR_OK) {
-                    ESP_LOGW(kTag, "Decode failed: %d", result);
-                    set_fail("E8 dec %d", static_cast<int>(result));
-                    raw.len = 0;
-                    break;
-                }
-                if (raw.consumed > raw.len) raw.consumed = raw.len;
-                raw.buffer += raw.consumed;
-                raw.len -= raw.consumed;
+                while (raw.len > 0 && stream_alive(episode) &&
+                       !ctx.stop.load(std::memory_order_acquire)) {
+                    esp_audio_simple_dec_out_t frame = {
+                        .buffer = output,
+                        .len = kOutputSize,
+                        .needed_size = 0,
+                        .decoded_size = 0,
+                    };
+                    const uint32_t before = raw.len;
+                    const esp_audio_err_t result =
+                        esp_audio_simple_dec_process(decoder, &raw, &frame);
+                    if (result == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                        ESP_LOGE(kTag, "Decoder needs %u bytes, buffer has %u",
+                                 static_cast<unsigned>(frame.needed_size),
+                                 static_cast<unsigned>(kOutputSize));
+                        set_fail("E7 buf %u/%u",
+                                 static_cast<unsigned>(frame.needed_size),
+                                 static_cast<unsigned>(kOutputSize));
+                        raw.len = 0;
+                        break;
+                    }
+                    if (result != ESP_AUDIO_ERR_OK) {
+                        ESP_LOGW(kTag, "Decode failed: %d", result);
+                        set_fail("E8 dec %d", static_cast<int>(result));
+                        raw.len = 0;
+                        break;
+                    }
+                    if (raw.consumed > raw.len) raw.consumed = raw.len;
+                    raw.buffer += raw.consumed;
+                    raw.len -= raw.consumed;
 
-                if (frame.decoded_size > 0) {
-                    esp_audio_simple_dec_info_t info = {};
-                    if (!format_ready &&
-                        esp_audio_simple_dec_get_info(decoder, &info) ==
-                            ESP_AUDIO_ERR_OK) {
-                        source_channels = std::clamp<uint8_t>(info.channel, 1, 2);
-                        if (info.bits_per_sample != 16 ||
-                            info.sample_rate < 8000 ||
-                            info.sample_rate > 48000 ||
-                            bsp_audio_set_format(info.sample_rate, 16, 1) !=
-                                ESP_OK) {
-                            ESP_LOGE(kTag, "Unsupported format: %luHz/%ubit/%uch",
+                    if (frame.decoded_size > 0) {
+                        esp_audio_simple_dec_info_t info = {};
+                        if (!ctx.format_ready.load(std::memory_order_acquire) &&
+                            esp_audio_simple_dec_get_info(decoder, &info) ==
+                                ESP_AUDIO_ERR_OK) {
+                            ctx.channels = std::clamp<uint8_t>(info.channel, 1, 2);
+                            if (info.bits_per_sample != 16 ||
+                                info.sample_rate < 8000 ||
+                                info.sample_rate > 48000 ||
+                                bsp_audio_set_format(info.sample_rate, 16, 1) !=
+                                    ESP_OK) {
+                                ESP_LOGE(kTag,
+                                         "Unsupported format: %luHz/%ubit/%uch",
+                                         static_cast<unsigned long>(
+                                             info.sample_rate),
+                                         info.bits_per_sample, ctx.channels);
+                                set_fail("E9 fmt %lu",
+                                         static_cast<unsigned long>(
+                                             info.sample_rate));
+                                raw.len = 0;
+                                break;
+                            }
+                            bsp_audio_set_volume(
+                                s_volume.load(std::memory_order_acquire));
+                            ctx.format_ready.store(true, std::memory_order_release);
+                            const PodcastEpisode preset = episode_snapshot(episode);
+                            ESP_LOGI(kTag, "Playing %s at %luHz/%uch -> mono",
+                                     preset.title,
                                      static_cast<unsigned long>(info.sample_rate),
-                                     info.bits_per_sample, source_channels);
-                            set_fail("E9 fmt %lu",
-                             static_cast<unsigned long>(info.sample_rate));
-                            raw.len = 0;
-                            break;
+                                     ctx.channels);
                         }
-                        bsp_audio_set_volume(s_volume.load(std::memory_order_acquire));
-                        format_ready = true;
-                        ESP_LOGI(kTag, "Playing %s at %luHz/%uch -> mono",
-                                 preset.title,
-                                 static_cast<unsigned long>(info.sample_rate),
-                                 source_channels);
-                    }
-                    if (format_ready) {
-                        const std::size_t mono_bytes =
-                            downmix_to_mono(frame.buffer, frame.decoded_size,
-                                            source_channels);
-                        if (bsp_audio_write(frame.buffer, mono_bytes) != ESP_OK)
-                            continue;
-                        calculate_levels(frame.buffer, mono_bytes, 1);
-                        if (!played_audio) {
-                            played_audio = true;
-                            podcast_ui_set_playback(PodcastPlaybackState::Playing,
-                                                    "正在播放");
+                        if (ctx.format_ready.load(std::memory_order_acquire)) {
+                            const std::size_t mono_bytes =
+                                downmix_to_mono(frame.buffer, frame.decoded_size,
+                                                ctx.channels);
+                            // Backpressure when the ring is full so we never
+                            // overwrite audio the consumer has not played yet.
+                            for (int tries = 0;
+                                 tries < 50 &&
+                                 ring_space(ctx) < mono_bytes;
+                                 ++tries) {
+                                vTaskDelay(pdMS_TO_TICKS(2));
+                            }
+                            if (ring_write(ctx, frame.buffer, mono_bytes) > 0) {
+                                xSemaphoreGive(ctx.data_new);
+                            }
                         }
                     }
-                }
 
-                if (raw.len == before || raw.consumed == 0) {
-                    // Parser cached this block (typical while ingesting the
-                    // M4A moov atom); fetch a fresh block instead of spinning.
-                    break;
+                    if (raw.len == before || raw.consumed == 0) {
+                        // Parser cached this block; fetch a fresh block instead
+                        // of spinning.
+                        break;
+                    }
                 }
             }
+            if (stream_eof) break;
         }
-    } while (false);
+    }
 
+    ctx.eof.store(true, std::memory_order_release);
+    ctx.client.store(nullptr, std::memory_order_release);
+    xSemaphoreGive(ctx.data_new);  // nudge a waiting consumer to check eof
     if (decoder) esp_audio_simple_dec_close(decoder);
-    free(output);
-    free(input);
     if (client) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
     }
     std::free(request_url);
+    std::free(input);
+    std::free(output);
+    ctx.producer_done.store(true, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
+    if (completed) *completed = false;
+    const PodcastEpisode preset = episode_snapshot(episode);
+    if (!preset.url[0]) {
+        ESP_LOGE(kTag, "Episode %u has no URL", static_cast<unsigned>(episode));
+        return false;
+    }
+    podcast_ui_set_playback(PodcastPlaybackState::Connecting, "正在连接节目");
+
+    // -------- consumer task (runs on player_task) --------
+    // It only drains surplus audio from the ring to the speaker when playing;
+    // the producer task fills the ring independently, which is what decouples
+    // network reads from real-time output.
+    static_assert(kPcmStartThreshold < kPcmRingSize, "start threshold must fit");
+    static_assert(kPcmCushion < kPcmRingSize, "cushion must fit");
+    PcmRing pcm(kPcmRingSize);
+    if (!pcm.buf) {
+        podcast_ui_set_playback(PodcastPlaybackState::Error, "缓冲内存不足");
+        return false;
+    }
+    StreamCtx ctx;
+    ctx.pcm = &pcm;
+    ctx.mutex = xSemaphoreCreateMutex();
+    ctx.data_new = xSemaphoreCreateCounting(8, 0);
+    if (!ctx.mutex || !ctx.data_new) {
+        if (ctx.mutex) vSemaphoreDelete(ctx.mutex);
+        if (ctx.data_new) vSemaphoreDelete(ctx.data_new);
+        podcast_ui_set_playback(PodcastPlaybackState::Error, "信号量创建失败");
+        return false;
+    }
+
+    ProducerArg arg;
+    arg.ctx = &ctx;
+    arg.url = preset.url;
+    arg.episode = episode;
+
+    podcast_ui_set_playback(PodcastPlaybackState::Buffering, "正在缓冲");
+    TaskHandle_t producer = nullptr;
+    if (xTaskCreate(stream_producer, "podcast_prod", 8192, &arg, 5,
+                    &producer) != pdPASS) {
+        vSemaphoreDelete(ctx.data_new);
+        vSemaphoreDelete(ctx.mutex);
+        podcast_ui_set_playback(PodcastPlaybackState::Error, "任务创建失败");
+        return false;
+    }
+
+    uint8_t *drain = static_cast<uint8_t *>(malloc(kDrainChunk));
+    if (!drain) {
+        ctx.stop.store(true, std::memory_order_release);
+        for (int i = 0; i < 60 && !ctx.producer_done.load(std::memory_order_acquire);
+             ++i) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        vSemaphoreDelete(ctx.data_new);
+        vSemaphoreDelete(ctx.mutex);
+        podcast_ui_set_playback(PodcastPlaybackState::Error, "缓冲内存不足");
+        return false;
+    }
+
+    bool started = false;
+    bool played_audio = false;
+    bool clean_eof = false;
+
+    while (stream_alive(episode)) {
+        // ---- pause: hold the stream; only stop draining. The producer keeps
+        // topping up the ring, so resume drains instantly (no re-buffer) ----
+        if (!s_wanted_playing.load(std::memory_order_acquire)) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+
+        // ---- wait for the codec format before writing anything ----
+        if (!ctx.format_ready.load(std::memory_order_acquire)) {
+            if (ctx.eof.load(std::memory_order_acquire) &&
+                ring_used(ctx) == 0) {
+                break;  // stream ended before any format was negotiated
+            }
+            xSemaphoreTake(ctx.data_new, pdMS_TO_TICKS(120));
+            continue;
+        }
+
+        // ---- pre-roll: start playing only once a cushion is buffered ----
+        if (!started) {
+            if (ring_used(ctx) >= kPcmStartThreshold) {
+                started = true;
+                if (!played_audio) {
+                    podcast_ui_set_playback(PodcastPlaybackState::Playing,
+                                            "正在播放");
+                }
+            } else {
+                if (ctx.eof.load(std::memory_order_acquire) &&
+                    ring_used(ctx) == 0) {
+                    break;
+                }
+                xSemaphoreTake(ctx.data_new, pdMS_TO_TICKS(100));
+                continue;
+            }
+        }
+
+        // ---- consume: drain the surplus to the speaker ----
+        bool drained_any = false;
+        while (started && ring_used(ctx) > kPcmCushion) {
+            const std::size_t take = std::min<std::size_t>(
+                ring_used(ctx) - kPcmCushion, kDrainChunk);
+            const std::size_t got = ring_read(ctx, drain, take);
+            if (got == 0) break;
+            if (bsp_audio_write(drain, got) != ESP_OK) break;
+            calculate_levels(drain, got, 1);
+            played_audio = true;
+            drained_any = true;
+        }
+
+        if (!drained_any) {
+            if (ctx.eof.load(std::memory_order_acquire)) {
+                // Network ended: drain whatever remains into the speaker as the
+                // tail, then finish. Drains even if the pre-roll threshold was
+                // never reached, so a short/ending stream still plays out.
+                started = true;
+                while (ring_used(ctx) > 0) {
+                    const std::size_t take = std::min<std::size_t>(
+                        ring_used(ctx), kDrainChunk);
+                    const std::size_t got = ring_read(ctx, drain, take);
+                    if (got == 0) break;
+                    if (bsp_audio_write(drain, got) != ESP_OK) break;
+                    calculate_levels(drain, got, 1);
+                    played_audio = true;
+                }
+                if (ring_used(ctx) == 0) {
+                    if (played_audio) {
+                        podcast_ui_set_playback(PodcastPlaybackState::Playing,
+                                                "正在播放");
+                    }
+                    clean_eof = played_audio;  // natural end after playback
+                    break;
+                }
+            } else {
+                xSemaphoreTake(ctx.data_new, pdMS_TO_TICKS(120));
+            }
+        }
+    }
+
+    // ---- wind the producer down and wait for it to release shared state ----
+    ctx.stop.store(true, std::memory_order_release);
+    esp_http_client_handle_t c = ctx.client.load(std::memory_order_acquire);
+    if (c) esp_http_client_close(c);  // unblock a read stuck at network timeout
+    for (int i = 0; i < 80 && !ctx.producer_done.load(std::memory_order_acquire);
+         ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    std::free(drain);
+    vSemaphoreDelete(ctx.data_new);
+    vSemaphoreDelete(ctx.mutex);
+    (void)producer;
+
     if (completed) *completed = clean_eof;
     return played_audio;
 }
