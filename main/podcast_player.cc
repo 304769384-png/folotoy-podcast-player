@@ -2,6 +2,7 @@
 
 #include "bsp_audio.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -52,9 +53,13 @@ constexpr uint8_t kMaxFailedAttempts = 3;
 // means the speaker keeps playing from the in-RAM cushion while a slow read
 // fills behind it, and pausing only halts the consumer so the buffer keeps
 // topping up (resume is instant instead of a full re-buffer).
-constexpr std::size_t kPcmRingSize = 65536;       // ~0.74 s @44.1 kHz mono
-constexpr std::size_t kPcmStartThreshold = 16384; // start after ~0.19 s buffered
-constexpr std::size_t kPcmCushion = 8192;         // keep this slack while playing
+// Ring is sized adaptively at run time (choose_ring_size) to fit the tight
+// ESP32-C3 heap. The old fixed 64 KB ring pushed peak usage into an
+// allocation failure ("E4 mem") once WiFi/TLS was up, even though the
+// producer's own input/output buffers and the HTTP/TLS working set are only
+// ~32 KB. These are the bounds the ring may take and the cushion logic uses.
+constexpr std::size_t kPcmRingSizeMax = 32768;   // ~0.37 s @44.1 kHz mono
+constexpr std::size_t kPcmRingSizeMin = 16384;   // floor we never dip under
 constexpr std::size_t kDrainChunk = 2048;
 
 // Simple single-producer / single-consumer ring buffer for decoded PCM.
@@ -651,6 +656,28 @@ void stream_producer(void *arg_ptr) {
     vTaskDelete(nullptr);
 }
 
+// Pick the decoded-PCM ring size that fits this moment's heap. On ESP32-C3 the
+// free pool is a moving target once WiFi/TLS/decoder are resident, so a fixed
+// 64 KB ring could exceed it and fail ("E4 mem"). We keep a firewall of free
+// heap for the decoder, the HTTPS handshake and the producer's own
+// input/output + HTTP buffers (roughly 32 KB all together), then take the
+// largest slice of what remains, rounded down to a 4 KB multiple and clamped
+// to [min, max]. Driving the split from free heap instead of a constant is
+// what lets the same dual-task architecture survive low-memory moments.
+std::size_t choose_ring_size() {
+    constexpr std::size_t kReserve = 32768;
+    const std::size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    std::size_t ring = kPcmRingSizeMax;
+    if (free_heap > kReserve) {
+        ring = std::min(kPcmRingSizeMax, free_heap - kReserve);
+    }
+    ring &= ~static_cast<std::size_t>(0xfff);  // round down to a 4 KB slice
+    ring = std::max(kPcmRingSizeMin, ring);
+    ESP_LOGI(kTag, "Free heap %u -> PCM ring %u",
+             static_cast<unsigned>(free_heap), static_cast<unsigned>(ring));
+    return ring;
+}
+
 bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     if (completed) *completed = false;
     const PodcastEpisode preset = episode_snapshot(episode);
@@ -664,9 +691,12 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     // It only drains surplus audio from the ring to the speaker when playing;
     // the producer task fills the ring independently, which is what decouples
     // network reads from real-time output.
-    static_assert(kPcmStartThreshold < kPcmRingSize, "start threshold must fit");
-    static_assert(kPcmCushion < kPcmRingSize, "cushion must fit");
-    PcmRing pcm(kPcmRingSize);
+    const std::size_t ring_size = choose_ring_size();
+    const std::size_t start_threshold = ring_size / 2;  // pre-roll cushion
+    // Keep a small slack so the drain loop doesn't spin on every byte; it is
+    // deliberately modest so a small ring still leaves most of it to play.
+    const std::size_t cushion = std::min<std::size_t>(ring_size / 8, 4096);
+    PcmRing pcm(ring_size);
     if (!pcm.buf) {
         podcast_ui_set_playback(PodcastPlaybackState::Error, "缓冲内存不足");
         return false;
@@ -734,7 +764,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
 
         // ---- pre-roll: start playing only once a cushion is buffered ----
         if (!started) {
-            if (ring_used(ctx) >= kPcmStartThreshold) {
+            if (ring_used(ctx) >= start_threshold) {
                 started = true;
                 if (!played_audio) {
                     podcast_ui_set_playback(PodcastPlaybackState::Playing,
@@ -752,9 +782,9 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
 
         // ---- consume: drain the surplus to the speaker ----
         bool drained_any = false;
-        while (started && ring_used(ctx) > kPcmCushion) {
+        while (started && ring_used(ctx) > cushion) {
             const std::size_t take = std::min<std::size_t>(
-                ring_used(ctx) - kPcmCushion, kDrainChunk);
+                ring_used(ctx) - cushion, kDrainChunk);
             const std::size_t got = ring_read(ctx, drain, take);
             if (got == 0) break;
             if (bsp_audio_write(drain, got) != ESP_OK) break;
