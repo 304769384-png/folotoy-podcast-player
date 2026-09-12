@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <strings.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -254,6 +255,33 @@ char *resolve_url(const char *base, const char *location) {
     return strdup((scheme + "//" + authority + base_path + location).c_str());
 }
 
+// esp_http_client only auto-follows 3xx inside the blocking perform() path;
+// the streaming open()->read() flow never does, so we resolve the hops by
+// hand. The handle is an opaque type, so we cannot read its parsed response
+// headers directly. The one public way to see a *response* header is the
+// HTTP_EVENT_ON_HEADER event, which carries each header key/value pair.
+// We capture the redirect's Location there so the manual follower can build
+// the next URL.
+struct RedirectCtx {
+    bool has_location = false;
+    char location[512];
+};
+
+esp_err_t redirect_event_handler(esp_http_client_event_t *evt) {
+    if (evt->event_id == HTTP_EVENT_ON_HEADER &&
+        evt->header_key != nullptr && evt->header_value != nullptr &&
+        strcasecmp(evt->header_key, "Location") == 0) {
+        RedirectCtx *ctx = static_cast<RedirectCtx *>(evt->user_data);
+        if (ctx != nullptr) {
+            std::strncpy(ctx->location, evt->header_value,
+                         sizeof(ctx->location) - 1);
+            ctx->location[sizeof(ctx->location) - 1] = '\0';
+            ctx->has_location = true;
+        }
+    }
+    return ESP_OK;
+}
+
 bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     if (completed) *completed = false;
     const PodcastEpisode preset = episode_snapshot(episode);
@@ -263,6 +291,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     }
     podcast_ui_set_playback(PodcastPlaybackState::Connecting, "正在连接节目");
 
+    RedirectCtx redirect_ctx{};
     esp_http_client_config_t config = {};
     config.url = preset.url;
     config.timeout_ms = 10000;
@@ -270,11 +299,14 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     config.buffer_size_tx = 512;
     config.user_agent = "AI-Passport-Podcast/0.1";
     config.keep_alive_enable = false;
-    // Streaming follows redirects by hand below (up to 4 hops, full per-hop
-    // teardown before re-open). Disable esp_http_client's own follower so the
-    // two mechanisms never both chase a 3xx on a cross-host TLS stream.
+    // esp_http_client only auto-follows redirects inside the blocking
+    // perform() path; the streaming open()->read() flow does not. So we
+    // resolve hops by hand below, capturing each Location via the
+    // HTTP_EVENT_ON_HEADER event into redirect_ctx.
     config.disable_auto_redirect = true;
     config.max_redirection_count = 0;
+    config.event_handler = redirect_event_handler;
+    config.user_data = &redirect_ctx;
     if (std::strncmp(preset.url, "https://", 8) == 0) {
         config.crt_bundle_attach = esp_crt_bundle_attach;
     }
@@ -300,6 +332,8 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
                 client = nullptr;
             }
             config.url = request_url;
+            redirect_ctx.has_location = false;
+            redirect_ctx.location[0] = '\0';
             client = esp_http_client_init(&config);
             if (!client) {
                 ESP_LOGE(kTag, "HTTP client allocation failed");
@@ -313,18 +347,17 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             esp_http_client_fetch_headers(client);
             const int status = esp_http_client_get_status_code(client);
             if (status >= 300 && status < 400) {
-                // esp_http_client_get_header() reads only the *request* headers,
-                // so it can never see a redirect's response "Location" header.
-                // ESP-IDF's HTTP parser stores the response Location into the
-                // client->location field instead, so use that directly. The
-                // field is allocated fresh on each esp_http_client_init(), so
-                // every hop starts from a clean NULL.
-                if (client->location == nullptr || client->location[0] == '\0') {
+                // esp_http_client_get_header() reads only *request* headers and
+                // the handle is opaque, so the redirect's response Location is
+                // only reachable through HTTP_EVENT_ON_HEADER, which
+                // redirect_event_handler above captured into redirect_ctx.
+                if (!redirect_ctx.has_location ||
+                    redirect_ctx.location[0] == '\0') {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
                     set_fail("E2 redirect no loc");
                     break;
                 }
-                char *next = resolve_url(request_url, client->location);
+                char *next = resolve_url(request_url, redirect_ctx.location);
                 std::free(request_url);
                 request_url = next;
                 continue;  // follow the redirect on the next hop
