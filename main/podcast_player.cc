@@ -313,27 +313,18 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
             esp_http_client_fetch_headers(client);
             const int status = esp_http_client_get_status_code(client);
             if (status >= 300 && status < 400) {
-                // esp_http_client_get_header() matches the header NAME
-                // case-sensitively (strcmp). CDNs commonly send lowercase
-                // "location:" (e.g. xiaoyuzhou's dts-api returns a 302 with
-                // "location:"), which made the old single "Location" lookup
-                // fail with E2 and abort every episode of those sources. Probe
-                // the common casings so redirect following is case-agnostic.
-                char *location = nullptr;
-                for (const char *key : {"Location", "location", "LOCATION"}) {
-                    char *v = nullptr;
-                    if (esp_http_client_get_header(client, key, &v) == ESP_OK &&
-                        v != nullptr && v[0] != '\0') {
-                        location = v;
-                        break;
-                    }
-                }
-                if (location == nullptr) {
+                // esp_http_client_get_header() reads only the *request* headers,
+                // so it can never see a redirect's response "Location" header.
+                // ESP-IDF's HTTP parser stores the response Location into the
+                // client->location field instead, so use that directly. The
+                // field is allocated fresh on each esp_http_client_init(), so
+                // every hop starts from a clean NULL.
+                if (client->location == nullptr || client->location[0] == '\0') {
                     ESP_LOGW(kTag, "HTTP redirect %d without Location", status);
                     set_fail("E2 redirect no loc");
                     break;
                 }
-                char *next = resolve_url(request_url, location);
+                char *next = resolve_url(request_url, client->location);
                 std::free(request_url);
                 request_url = next;
                 continue;  // follow the redirect on the next hop
