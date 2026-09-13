@@ -77,8 +77,9 @@ constexpr uint32_t kBufferingStallTimeoutMs = 6000;
 // (recv timeout / EAGAIN) mid-stream. That is NOT a hard stream failure: retry
 // with backoff and only give up after several consecutive stalls, otherwise one
 // momentary CDN hiccup would abort a whole 2-hour episode with "E5 read err".
-constexpr std::size_t kMaxTransientStalls = 4;
-constexpr uint32_t kTransientStallRetryMs = 150;
+constexpr std::size_t kMaxTransientStalls = 12;
+constexpr uint32_t kTransientStallRetryMsBase = 150;
+constexpr uint32_t kTransientStallRetryMsMax = 1500;
 
 
 // Simple single-producer / single-consumer ring buffer for decoded PCM.
@@ -539,6 +540,8 @@ void stream_producer(void *arg_ptr) {
 
         bool stream_eof = false;
         std::size_t transient_stalls = 0;
+        std::size_t total_bytes = 0;
+        bool saw_format = false;
         while (stream_alive(episode) && !ctx.stop.load(std::memory_order_acquire)) {
             if (ctx.format_ready.load(std::memory_order_acquire) &&
                 ring_space(ctx) == 0) {
@@ -552,17 +555,26 @@ void stream_producer(void *arg_ptr) {
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
                 if (++transient_stalls <= kMaxTransientStalls) {
+                    // Adaptive backoff: a slow C3 M4A/AAC decode can starve the
+                    // ring and pause network reads for ~1s, so a fixed tiny
+                    // retry window expired too fast. Cap the total budget.
+                    const std::size_t n = transient_stalls;
+                    const uint32_t backoff =
+                        std::min(kTransientStallRetryMsBase + n * 120,
+                                 kTransientStallRetryMsMax);
                     ESP_LOGW(kTag,
                              "Stream read stall %zu/%zu (rc=%d errno=%d); "
                              "recovering",
                              transient_stalls, kMaxTransientStalls, received,
                              errno);
-                    vTaskDelay(pdMS_TO_TICKS(kTransientStallRetryMs));
+                    vTaskDelay(pdMS_TO_TICKS(backoff));
                     continue;
                 }
                 ESP_LOGW(kTag,
-                         "Stream read failed %zux (last rc=%d errno=%d)",
-                         transient_stalls, received, errno);
+                         "Stream read failed %zux (last rc=%d errno=%d, "
+                         "bytes=%zu, format=%s)",
+                         transient_stalls, received, errno, total_bytes,
+                         saw_format ? "ok" : "none");
                 set_fail("E5 read err");
                 break;
             }
@@ -574,9 +586,13 @@ void stream_producer(void *arg_ptr) {
                     // Not the true end, just a pause between chunk bursts; a
                     // 2.5h episode must not be truncated by one idle moment.
                     if (++transient_stalls <= kMaxTransientStalls) {
+                        const std::size_t nn = transient_stalls;
+                        const uint32_t bk =
+                            std::min(kTransientStallRetryMsBase + nn * 120,
+                                     kTransientStallRetryMsMax);
                         ESP_LOGW(kTag, "Stream idle (%zu), recovering",
                                  transient_stalls);
-                        vTaskDelay(pdMS_TO_TICKS(kTransientStallRetryMs));
+                        vTaskDelay(pdMS_TO_TICKS(bk));
                         continue;
                     }
                     ESP_LOGW(kTag, "Stream idle; giving up");
@@ -594,6 +610,8 @@ void stream_producer(void *arg_ptr) {
             }
 
             if (received > 0) {
+                total_bytes += static_cast<std::size_t>(received);
+                if (ctx.format_ready.load(std::memory_order_acquire)) saw_format = true;
                 esp_audio_simple_dec_raw_t raw = {
                     .buffer = input,
                     .len = static_cast<uint32_t>(received),
