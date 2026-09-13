@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -60,7 +61,17 @@ constexpr uint8_t kMaxFailedAttempts = 3;
 // ~32 KB. These are the bounds the ring may take and the cushion logic uses.
 constexpr std::size_t kPcmRingSizeMax = 32768;   // ~0.37 s @44.1 kHz mono
 constexpr std::size_t kPcmRingSizeMin = 16384;   // floor we never dip under
+constexpr std::size_t kPcmCushion = 8192;         // keep this slack while playing
 constexpr std::size_t kDrainChunk = 2048;
+
+// Buffering watchdog bounds (ms). Some podcast CDNs (e.g. Fireside/hosting
+// CDNs behind two 3xx hops) are slow to first byte, so the "no audio at all"
+// budget is generous; but once audio is being decoded into the ring we require
+// steady progress so a starved/trickling stream fails fast instead of showing
+// "正在缓冲" forever.
+constexpr uint32_t kBufferingNoDataTimeoutMs = 12000;
+constexpr uint32_t kBufferingStallTimeoutMs = 6000;
+
 
 // Simple single-producer / single-consumer ring buffer for decoded PCM.
 struct PcmRing {
@@ -113,6 +124,13 @@ struct StreamCtx {
     std::atomic<bool> stop{false};        // consumer asked the producer to wind down
     std::atomic<bool> producer_done{false};
     std::atomic<esp_http_client_handle_t> client{nullptr};
+    // Watchdog anchors: started_tick is stamped when the consumer begins
+    // buffering; last_data_tick is refreshed whenever decoded PCM reaches the
+    // ring. Together they bound "正在缓冲" so a trickling or stalled CDN can
+    // never hold the player there forever (the slow-TTFB fixes at the read
+    // layer are useless if the UI never gives up and retries).
+    std::atomic<uint32_t> started_tick{0};
+    std::atomic<uint32_t> last_data_tick{0};
     uint8_t channels = 1;
 };
 
@@ -438,7 +456,7 @@ void stream_producer(void *arg_ptr) {
     RedirectCtx redirect_ctx{};
     esp_http_client_config_t config = {};
     config.url = preset_url;
-    config.timeout_ms = 10000;
+    config.timeout_ms = 20000;
     config.buffer_size = 8192;
     config.buffer_size_tx = 1024;
     config.user_agent = "AI-Passport-Podcast/0.1";
@@ -519,7 +537,8 @@ void stream_producer(void *arg_ptr) {
             const int received = esp_http_client_read(
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
-                ESP_LOGW(kTag, "Stream read error");
+                ESP_LOGW(kTag, "Stream read error %d (errno %d)",
+                         received, errno);
                 set_fail("E5 read err");
                 break;
             }
@@ -606,6 +625,8 @@ void stream_producer(void *arg_ptr) {
                             bsp_audio_set_volume(
                                 s_volume.load(std::memory_order_acquire));
                             ctx.format_ready.store(true, std::memory_order_release);
+                            ctx.last_data_tick.store(xTaskGetTickCount(),
+                                                     std::memory_order_release);
                             const PodcastEpisode preset = episode_snapshot(episode);
                             ESP_LOGI(kTag, "Playing %s at %luHz/%uch -> mono",
                                      preset.title,
@@ -625,6 +646,9 @@ void stream_producer(void *arg_ptr) {
                                 vTaskDelay(pdMS_TO_TICKS(2));
                             }
                             if (ring_write(ctx, frame.buffer, mono_bytes) > 0) {
+                                ctx.last_data_tick.store(
+                                    xTaskGetTickCount(),
+                                    std::memory_order_release);
                                 xSemaphoreGive(ctx.data_new);
                             }
                         }
@@ -718,6 +742,7 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
     arg.episode = episode;
 
     podcast_ui_set_playback(PodcastPlaybackState::Buffering, "正在缓冲");
+    ctx.started_tick.store(xTaskGetTickCount(), std::memory_order_release);
     TaskHandle_t producer = nullptr;
     if (xTaskCreate(stream_producer, "podcast_prod", 8192, &arg, 5,
                     &producer) != pdPASS) {
@@ -750,6 +775,27 @@ bool stream_episode(std::size_t episode, uint32_t generation, bool *completed) {
         if (!s_wanted_playing.load(std::memory_order_acquire)) {
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
+        }
+
+        // ---- buffering watchdog: never leave "正在缓冲" spinning ----
+        if (!started &&
+            s_wanted_playing.load(std::memory_order_acquire)) {
+            const uint32_t now = xTaskGetTickCount();
+            const uint32_t last = ctx.last_data_tick.load(
+                std::memory_order_acquire);
+            const bool stall =
+                (last != 0)
+                    ? (now - last) >
+                          pdMS_TO_TICKS(kBufferingStallTimeoutMs)
+                    : (now - ctx.started_tick.load(
+                                 std::memory_order_acquire)) >
+                          pdMS_TO_TICKS(kBufferingNoDataTimeoutMs);
+            if (stall) {
+                ESP_LOGW(kTag, "Buffering stalled (no %s), retrying",
+                         last ? "new audio" : "audio at all");
+                set_fail("E9 stall");
+                break;
+            }
         }
 
         // ---- wait for the codec format before writing anything ----
