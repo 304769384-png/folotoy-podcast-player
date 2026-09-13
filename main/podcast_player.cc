@@ -72,6 +72,14 @@ constexpr std::size_t kDrainChunk = 2048;
 constexpr uint32_t kBufferingNoDataTimeoutMs = 12000;
 constexpr uint32_t kBufferingStallTimeoutMs = 6000;
 
+// Long-podcast CDNs (many serve over HTTP/2 and can pause a few seconds, e.g.
+// xiaoyuzhou/xyzcdn here) make esp_http_client_read() return a negative result
+// (recv timeout / EAGAIN) mid-stream. That is NOT a hard stream failure: retry
+// with backoff and only give up after several consecutive stalls, otherwise one
+// momentary CDN hiccup would abort a whole 2-hour episode with "E5 read err".
+constexpr std::size_t kMaxTransientStalls = 4;
+constexpr uint32_t kTransientStallRetryMs = 150;
+
 
 // Simple single-producer / single-consumer ring buffer for decoded PCM.
 struct PcmRing {
@@ -460,7 +468,13 @@ void stream_producer(void *arg_ptr) {
     config.buffer_size = 8192;
     config.buffer_size_tx = 1024;
     config.user_agent = "AI-Passport-Podcast/0.1";
-    config.keep_alive_enable = false;
+    // Keep the TCP connection alive through slow decode / backpressure gaps so a
+    // multi-hour stream is not silently dropped by a NAT or server idle timeout
+    // (which shows up as a reproducible mid-stream "E5 read err").
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 10;
+    config.keep_alive_interval = 3;
+    config.keep_alive_count = 3;
     config.disable_auto_redirect = true;
     config.max_redirection_count = 0;
     config.event_handler = redirect_event_handler;
@@ -524,7 +538,7 @@ void stream_producer(void *arg_ptr) {
         esp_http_client_set_header(client, "Accept-Encoding", "identity");
 
         bool stream_eof = false;
-        int empty_reads = 0;
+        std::size_t transient_stalls = 0;
         while (stream_alive(episode) && !ctx.stop.load(std::memory_order_acquire)) {
             if (ctx.format_ready.load(std::memory_order_acquire) &&
                 ring_space(ctx) == 0) {
@@ -537,20 +551,38 @@ void stream_producer(void *arg_ptr) {
             const int received = esp_http_client_read(
                 client, reinterpret_cast<char *>(input), kInputSize);
             if (received < 0) {
-                ESP_LOGW(kTag, "Stream read error %d (errno %d)",
-                         received, errno);
+                if (++transient_stalls <= kMaxTransientStalls) {
+                    ESP_LOGW(kTag,
+                             "Stream read stall %zu/%zu (rc=%d errno=%d); "
+                             "recovering",
+                             transient_stalls, kMaxTransientStalls, received,
+                             errno);
+                    vTaskDelay(pdMS_TO_TICKS(kTransientStallRetryMs));
+                    continue;
+                }
+                ESP_LOGW(kTag,
+                         "Stream read failed %zux (last rc=%d errno=%d)",
+                         transient_stalls, received, errno);
                 set_fail("E5 read err");
                 break;
             }
+            transient_stalls = 0;  // any successful read clears the count
             if (received == 0) {
-                if (++empty_reads > 3) {
-                    stream_eof = true;
+                if (esp_http_client_is_complete_data_received(client)) {
+                    stream_eof = true;  // server confirms all bytes were sent
                 } else {
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                    continue;
+                    // Not the true end, just a pause between chunk bursts; a
+                    // 2.5h episode must not be truncated by one idle moment.
+                    if (++transient_stalls <= kMaxTransientStalls) {
+                        ESP_LOGW(kTag, "Stream idle (%zu), recovering",
+                                 transient_stalls);
+                        vTaskDelay(pdMS_TO_TICKS(kTransientStallRetryMs));
+                        continue;
+                    }
+                    ESP_LOGW(kTag, "Stream idle; giving up");
+                    stream_eof = true;
                 }
             }
-            empty_reads = 0;
 
             if (!decoder) {
                 decoder = open_decoder(preset_url);
